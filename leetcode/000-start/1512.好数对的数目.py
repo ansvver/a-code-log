@@ -2,7 +2,7 @@
 Author: ansvver an5vv3r@outlook.com
 Date: 2024-12-25 22:49:06
 LastEditors: ansvver an5vv3r@outlook.com
-LastEditTime: 2024-12-25 22:57:46
+LastEditTime: 2024-12-25 23:00:54
 FilePath: \a-code-log\leetcode\000-start\1512.好数对的数目.py
 Description: 
 
