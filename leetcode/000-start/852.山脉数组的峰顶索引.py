@@ -2,7 +2,7 @@
 Author: ansvver an5vv3r@outlook.com
 Date: 2024-12-29 23:09:18
 LastEditors: ansvver an5vv3r@outlook.com
-LastEditTime: 2024-12-29 23:20:22
+LastEditTime: 2024-12-29 23:23:03
 FilePath: \a-code-log\leetcode\000-start\852.山脉数组的峰顶索引.py
 Description: 
 
