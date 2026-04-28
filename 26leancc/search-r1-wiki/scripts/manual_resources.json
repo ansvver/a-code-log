@@ -1,0 +1,125 @@
+[
+  {
+    "title": "Step-DeepResearch",
+    "slug": "step-deepresearch",
+    "primary_url": "https://github.com/stepfun-ai/StepDeepResearch",
+    "sections": [
+      "Supplemental Resources"
+    ],
+    "entry_note": "Supplemental repository resource added manually.",
+    "links": [
+      {
+        "label": "Code",
+        "url": "https://github.com/stepfun-ai/StepDeepResearch",
+        "kind": "code",
+        "source_column": "Code"
+      },
+      {
+        "label": "Paper",
+        "url": "https://arxiv.org/abs/2512.20491",
+        "kind": "paper",
+        "source_column": "Paper"
+      },
+      {
+        "label": "Homepage",
+        "url": "https://stepfun.com/",
+        "kind": "project",
+        "source_column": "Project"
+      },
+      {
+        "label": "Model API",
+        "url": "https://platform.stepfun.com/interface-key",
+        "kind": "model",
+        "source_column": "Model"
+      }
+    ]
+  },
+  {
+    "title": "OpenSeeker: Democratizing Frontier Search Agents by Fully Open-Sourcing Training Data",
+    "slug": "openseeker",
+    "primary_url": "https://github.com/rui-ye/OpenSeeker",
+    "sections": [
+      "Supplemental Resources"
+    ],
+    "entry_note": "Supplemental repository resource added manually.",
+    "links": [
+      {
+        "label": "Code",
+        "url": "https://github.com/rui-ye/OpenSeeker",
+        "kind": "code",
+        "source_column": "Code"
+      },
+      {
+        "label": "Paper",
+        "url": "https://arxiv.org/abs/2603.15594",
+        "kind": "paper",
+        "source_column": "Paper"
+      },
+      {
+        "label": "Dataset",
+        "url": "https://huggingface.co/datasets/OpenSeeker/OpenSeeker-v1-Data",
+        "kind": "dataset",
+        "source_column": "Dataset"
+      },
+      {
+        "label": "Model",
+        "url": "https://huggingface.co/OpenSeeker/OpenSeeker-v1-30B-SFT",
+        "kind": "model",
+        "source_column": "Model"
+      }
+    ]
+  },
+  {
+    "title": "OpenResearcher",
+    "slug": "openresearcher",
+    "primary_url": "https://github.com/TIGER-AI-Lab/OpenResearcher",
+    "sections": [
+      "Supplemental Resources"
+    ],
+    "entry_note": "Supplemental repository resource added manually.",
+    "links": [
+      {
+        "label": "Code",
+        "url": "https://github.com/TIGER-AI-Lab/OpenResearcher",
+        "kind": "code",
+        "source_column": "Code"
+      },
+      {
+        "label": "Paper",
+        "url": "https://arxiv.org/abs/2603.20278",
+        "kind": "paper",
+        "source_column": "Paper"
+      },
+      {
+        "label": "Dataset",
+        "url": "https://huggingface.co/datasets/OpenResearcher/OpenResearcher-Dataset",
+        "kind": "dataset",
+        "source_column": "Dataset"
+      },
+      {
+        "label": "Corpus",
+        "url": "https://huggingface.co/datasets/OpenResearcher/OpenResearcher-Corpus",
+        "kind": "dataset",
+        "source_column": "Dataset"
+      },
+      {
+        "label": "Model",
+        "url": "https://huggingface.co/OpenResearcher/OpenResearcher-30B-A3B",
+        "kind": "model",
+        "source_column": "Model"
+      },
+      {
+        "label": "Demo",
+        "url": "https://huggingface.co/spaces/OpenResearcher/OpenResearcher",
+        "kind": "project",
+        "source_column": "Project"
+      },
+      {
+        "label": "Eval Logs",
+        "url": "https://huggingface.co/datasets/OpenResearcher/OpenResearcher-Eval-Logs",
+        "kind": "dataset",
+        "source_column": "Dataset"
+      }
+    ]
+  }
+]

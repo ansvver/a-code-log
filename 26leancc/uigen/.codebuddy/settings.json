@@ -1,0 +1,8 @@
+{
+  "model": "claude-sonnet-4-20250514",
+  "customInstructions": "This is a Next.js project using TypeScript, Prisma, and the Vercel AI SDK. Follow the patterns established in CODEBUDDY.md.",
+  "permissions": {
+    "allow": ["mcp__playwright"],
+    "deny": []
+  }
+}

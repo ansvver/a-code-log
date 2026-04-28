@@ -1,0 +1,756 @@
+# 企业内部知识库与内部工具的高效本地化 Agentic-Search 训练实施方案
+
+## 1. 项目目标
+
+构建一个可本地部署的 Agentic-Search 模型，使其能在企业内网环境中：
+
+- 对内部知识库、实体目录、报表系统做少量多轮检索
+- 在必要时拆分问题并并行查询
+- 使用证据回答，而不是凭参数知识硬答
+- 在证据不足、工具失败、权限不足时明确拒答或降级
+- 在准确率可接受前提下尽量减少推理轮次、工具调用数与 token 成本
+
+## 2. 首版范围
+
+### 2.1 工具范围
+只做 4 类只读工具：
+
+- `search_docs(query, filters, top_k)`
+- `open_doc(doc_id, section_ids?)`
+- `lookup_entity(entity_type, keys)`
+- `run_report_readonly(report_name, filters)`
+
+### 2.2 不在首版范围内
+- 浏览器自动化
+- 写操作工具
+- SQL 自由生成执行
+- 多智能体协作
+- 多模态
+- 在线真实系统 RL
+
+### 2.3 成功标准
+- 工具协议稳定输出
+- 企业问答主场景可用
+- 多文档/多工具问题可控
+- 轮次和调用次数明显优于 naive ReAct / 搜到死
+
+### 2.4 关键借鉴映射总表
+
+| 论文 | 原文要解决的问题 | 原文采用的方案 | 我们在企业场景的兼容改造 |
+|---|---|---|---|
+| `Search-R1` | 推理模型不会自然高质量调用搜索工具 | 用 RL 训练 reasoning + search interleaving，并用 retrieved token masking 稳定训练 | 不直接沿用 open-web search，而是把它改成企业 4 类只读工具的最小 baseline 骨架 |
+| `R1-Searcher` | 冷启动时没有复杂 PRM 或 teacher 轨迹也难起步 | 两阶段 outcome-RL，先建立搜索反射再强化 | 作为低复杂度备选基线，用于验证“只靠结果奖励是否足够”，但不作为最终奖励体系 |
+| `R1-Searcher++` | 模型容易忽略自身已有知识，导致能直接答的问题也去外部搜索 | 两阶段训练，并显式奖励 internal knowledge utilization，同时引入 memorization 机制持续吸收检索结果 | 企业版把“internal knowledge”改成“参数内已有能力 + 当前 memory 中已验证事实”，训练 `该直接答 / 该继续搜 / 该停止` 的路由决策 |
+| `SimpleDeepSearcher` | 高质量 agent trajectory 稀缺，RL 成本高 | 强化数据合成与样本筛选，少量高质量 SFT 也能有明显收益 | 我们优先做企业 Gold/Silver/Boundary 数据引擎，把 RL 延后到数据和协议稳定之后 |
+| `OpenSeeker` | 高性能 search agent 的训练数据不透明，且 teacher 轨迹噪声大 | 用 fact-grounded controllable QA synthesis 构造可控难题，再用 retrospective summarization 做 trajectory denoising | 把 web graph 逆向构题改成企业实体图/制度依赖图构题，把 retrospection 改成企业 Silver 轨迹去噪器 |
+| `SynPlanResearch-R1` | 冷启动 agent 容易浅搜、偏用某个工具、过早结束 | 先合成 synthetic plan，SFT 纠正探索行为，再接 RL | 我们把 synthetic plan 改成企业工具版本，专门覆盖 `search_docs`/`lookup_entity` 的探索顺序和早停边界 |
+| `MedResearcher-R1` | 垂域知识稠密、专业工具特殊，通用 agent 数据不够用 | 用领域 KG 构题、专有工具和轨迹流水线做垂域数据 | 把医疗 KG 思路改造成企业实体图/制度依赖图/知识目录图，用于生成企业 hard multi-hop 数据 |
+| `DeepDive` | 开源模型长链路搜索弱，且难题数据不足 | KG 自动生成难题，多轮 RL，加入冗余 query 惩罚 | 我们吸收两点：一是用企业关系图合成 hard case，二是把冗余 query 惩罚迁移到效率奖励 |
+| `ZeroSearch` | 在线搜索训练贵且噪声大 | 用模拟搜索替代真实搜索，做 curriculum RL | 企业内网训练阶段完全离线化，所有工具调用都先快照缓存或模拟，不碰真实系统 |
+| `SearchGym` | 静态快照环境与真实环境不对齐，奖励会错 | 构建可验证 KG + 文档的高保真模拟环境，验证 sim-to-real | 我们做企业版三层环境：synthetic、snapshot、shadow-live，训练和评测严格分离 |
+| `DeepResearcher` | 静态 RAG 环境难学到真实交互中的交叉验证、自反思与诚实失败 | 在真实开放环境中做 end-to-end RL，并用浏览/抽取模块处理异构页面噪声 | v1 不直接把真实企业系统放进 RL loop，只借鉴它的 `cross-check / self-correction / honest failure` 模式，用于 teacher 轨迹生成和 shadow-live 上限评测 |
+| `OpenResearcher` | 真实 Search API 成本高、不可复现，长轨迹合成难规模化 | 将 corpus bootstrapping 与 trajectory synthesis 解耦，在离线语料上用 `search/open/find` 显式原语做全离线深研环境 | 企业版按“每次快照一次 bootstrap”构建本地 search service；保留小而显式的只读原语，必要时 v1.1 增加 `find_in_doc` |
+| `Step-DeepResearch` | 开放 benchmark 难覆盖真实 open-ended research，训练目标也未按能力拆开 | 以 atomic capabilities 分解训练目标，并配合 progressive training 与 checklist-style judger | 企业版只借鉴能力分层和 checklist evaluator，不照搬其 `file/todo/shell` 工具空间和开放式报告目标 |
+| `Agentic-R` | 传统 RAG retriever 不适合 agentic search 的 passage utility | 用 agent 轨迹和最终正确性共同训练 retriever | 企业 dense retriever 单列训练，用 agent rollout 反标 utility，不再默认复用通用 embedding 检索器 |
+| `SmartSearch` | agent 中间 query 质量差，导致后续路径都跑偏 | query-level process reward + query refinement + curriculum | 在企业内网中对 query 做模板化字段抽取、实体别名展开、制度关键词补全，再给 refinement reward |
+| `Search-P1` | 只看最终答案会导致中间失败轨迹完全浪费 | 用 path-centric reward 从失败路径里提取学习信号 | 我们把路径评分改成“工具顺序、证据覆盖、轮次预算、是否早停”综合分，而不只看最终答案 |
+| `Evaluate-as-Action` | retrieval quality 判断隐式存在，信用分配过粗 | 把检索后自评变成显式动作，再按 segment 重新分配 advantage | 企业版里把自评变成结构化 `evidence_check` 节点，直接检查 doc 命中、字段覆盖、冲突状态 |
+| `CaRR` | outcome reward 会容忍“答对但证据链错” | citation-aware rubric reward，检查证据链和隐藏实体覆盖 | 企业版里引用不暴露给用户，但训练时强制 answer 绑定到 `doc_id/section_id/entity_id` 级别的证据 |
+| `ProRAG` | 长链路 credit assignment 模糊，容易出现 process hallucination | 训练 learned PRM，给中间步骤更细粒度监督 | v1 先不上 learned PRM，保留为 v2 方案；先用规则奖励，等规则奖励边界跑清楚再学 reward model |
+| `BAPO` | agent 很少承认不知道，可靠性差 | 显式训练 IDK boundary，同时防止模型过度利用 IDK 偷懒 | 企业版把 `IDK` 扩展成 `证据不足 / 权限不足 / 工具失败 / 结果冲突` 四类边界拒答 |
+| `Search More, Think Less` | 长任务靠深想导致时延高、轮次多 | 用 parallel evidence acquisition 替代长串 reasoning | 我们把并行限定在可判定独立的企业子问题上，不追求 open-web 式无限搜索宽度 |
+| `ParallelSearch` | 本可并行的问题被顺序搜索拖慢 | 训练模型识别可并行子查询并发调用 | 工具协议天然支持 `calls[]` 并发，评测单列 `parallelizable question` 切片 |
+| `Search Wisely` | over-search / under-search 同时存在 | 用不确定性阈值优化搜索决策 | 企业版加入 `should_search` 与 `should_stop` 两个显式判别头或辅助标签，纳入评测与奖励 |
+| `ReSum` | 长上下文膨胀，继续探索成本过高 | 周期性摘要历史，再做 ReSum-GRPO | 企业版优先做 training-free summary memory，再决定是否上 memory RL |
+| `MemSearcher` | 保留全历史太贵，只看当前轮又丢信息 | 引入 compact memory，并做 memory-aware RL | 企业版 memory 只保留实体状态、已验证事实、已试过的 query、冲突标记，不保留长原文全文 |
+
+## 3. Student 模型选择方式
+
+不先拍脑袋指定模型家族。
+
+### 3.1 候选范围
+- 本地可训、可部署、`<=8B`
+- 可以是 `base`、`instruct` 或 `thinking` 起点
+- 以当前开源小模型中的强候选为池子，最终只选 1 个主 student
+
+### 3.2 Stage 0 模型 bakeoff
+对每个候选 student 做同一套 1k-3k 样本的小规模对齐试验，统一比较：
+
+- `Tool JSON pass rate`
+- `Oracle tool hit rate`
+- `Answer accuracy`
+- `Avg turns`
+- `Avg tool calls`
+- `P95 latency`
+- `tokens/sec`
+- `memory footprint`
+
+### 3.3 选型规则
+最终选 Pareto 最优点：
+
+- 若两个模型精度接近，优先选轮次更少、调用更少、推理更快的
+- 若两个模型效率接近，优先选证据一致性更高、拒答更稳的
+- 不允许只因为 benchmark 分高就选需要明显更多轮次的模型
+
+## 4. 数据工程
+
+### 4.1 内部数据主来源
+把 [r1-v1.md](../../r1-v1.md) 中已有的思路仅保留为数据资产来源：
+
+- `<问题, 目标知识, 答案>`
+- `<问题, 答案>`
+- FAQ
+- 工单结案与 SOP
+- 制度文档与 wiki
+- 报表说明、字段说明、实体目录
+
+### 4.2 统一样本 schema
+
+```json
+{
+  "question": "...",
+  "gold_answer": "...",
+  "support_docs": ["doc_1", "doc_2"],
+  "support_entities": ["entity_1"],
+  "oracle_tools": ["search_docs", "lookup_entity"],
+  "abstain_expected": false,
+  "difficulty": "single_hop|multi_hop|tool_mix|abstain",
+  "trajectory": {"messages": [...]}
+}
+```
+
+### 4.3 数据分层
+
+#### Gold
+- 有明确支持文档或实体
+- 能验证最终答案
+- 这是 SFT 的核心数据
+
+#### Silver
+- 只有答案，没有支持证据
+- 由 teacher 倒推轨迹并通过 verifier 过滤
+
+#### Hard Synthetic
+- 通过文档链接、实体关系、制度依赖生成多跳问题
+- 参考 `MedResearcher-R1`、`DeepDive`
+
+#### Boundary / Negative
+- 证据不足
+- 文档冲突
+- 工具失败
+- 权限不足
+- 检索为空
+- 高相似但无关的干扰文档
+
+#### Efficiency
+- 同一问题构造短路径与冗余长路径对比样本
+- 用于训练少轮次、少调用策略
+
+### 4.4 数据工程中的借鉴与改造
+
+#### Gold 数据
+- 要解决的问题：企业场景没有标准化 agent trajectory，但有大量“问题 + 正确答案 + 支撑知识”。
+- 借鉴：`SimpleDeepSearcher`、`Search-R1`
+- 原文方案：
+  - 用高质量样本直接做 agent 轨迹 SFT
+  - 把工具调用和回答过程绑定起来
+- 我们的改造：
+  - 不用真实搜索生成 Gold 轨迹
+  - 直接从 `support_docs/support_entities` 反演 `plan -> tool_call -> evidence -> answer`
+  - 这样可以保证每条轨迹都可验证、可回放、可奖励
+
+#### Silver 数据
+- 要解决的问题：只有答案，没有证据，直接丢弃会损失大量企业数据。
+- 借鉴：`R1-Searcher`、`SynPlanResearch-R1`、`OpenSeeker`
+- 原文方案：
+  - 利用冷启动轨迹和 RL 探索补足路径
+  - 通过 synthetic plan 约束探索方向
+  - 用 retrospective summarization 对 teacher 轨迹去噪，去掉无贡献动作
+- 我们的改造：
+  - 先由 teacher 倒推出工具顺序和候选证据
+  - 再通过 snapshot 检索器验证是否命中真实企业文档
+  - 在入库前把轨迹压成 `plan / key evidence / discarded loops / final answer` 四段，过滤冗余轮次和无贡献调用
+  - 只有“答对且证据能回链”的样本进入 Silver
+
+#### Hard Synthetic 数据
+- 要解决的问题：企业 FAQ 往往偏简单，无法逼出多跳推理和工具协同。
+- 借鉴：`MedResearcher-R1`、`DeepDive`、`OpenSeeker`
+- 原文方案：
+  - 用 KG/关系图合成复杂多跳问题
+  - 把 rare entity、长链依赖、难找证据纳入题目构造
+  - 用 controllable QA synthesis 显式控制题目覆盖范围、跳数和实体混淆
+- 我们的改造：
+  - 图结构从公开 KG 改成企业实体图、制度依赖图、流程状态图、报表字段图
+  - 参考 topological expansion / entity obfuscation，把问题难度按 hop 数、工具数、同名实体干扰、跨制度冲突可控化
+  - 不追求开放式报告，而是构造“必须跨 2-3 个工具或 2-4 份文档才能答”的问题
+
+#### Boundary / Negative 数据
+- 要解决的问题：企业落地中最大的风险是错答，不是不会答。
+- 借鉴：`BAPO`、`CaRR`
+- 原文方案：
+  - 训练 IDK boundary
+  - 用证据链 reward 防 hallucination
+- 我们的改造：
+  - Boundary 不只包含“无答案”，还包含“权限不足”“文档冲突”“工具错误”“证据不闭环”
+  - 每类 boundary 都要有显式标签，避免模型把所有不确定情况都压成同一种拒答
+
+#### Efficiency 数据
+- 要解决的问题：模型容易学会一条能答对但很慢、很啰嗦、搜太多轮的路径。
+- 借鉴：`Search Wisely`、`Search More, Think Less`、`ParallelSearch`
+- 原文方案：
+  - 分析 over-search / under-search
+  - 鼓励并行搜索和少轮次策略
+- 我们的改造：
+  - 对同一问题保留一条“最短可行路径”和一条“冗余路径”
+  - 训练时显式比较哪种路径在正确率不变时轮次更少、调用更少
+
+### 4.5 可用的公开补充数据
+
+#### 用于多跳问答与检索泛化
+- HotpotQA
+- 2WikiMultiHopQA
+- MuSiQue
+- Bamboogle
+- NQ
+- TriviaQA
+- PopQA
+
+#### 用于本项目最直接的 agent 训练参考
+- Search-R1 轨迹与代码
+- ZeroSearch dataset / simulation 思路
+- SearchGym-test-data
+- SimpleDeepSearcher 0.8k
+- DeepDive dataset
+- syn-plan-research-data-sft / rl / eval
+- CaRR-DeepDive 数据与 rubric reward 资源
+- OpenResearcher `97K+` trajectory dataset / offline environment / local search service
+- OpenSeeker-v1-Data `11.7K` fully open training data
+
+#### 不建议直接作为主训练源
+- GAIA
+- BrowseComp
+- XBench
+- WebWalkerQA
+
+原因：更偏公开网页、浏览器、开放任务，不符合企业内网主分布。
+
+#### 用于能力拆分与 checklist / 评测参考
+- Step-DeepResearch technical report
+- ADR-Bench 的开放式研究任务定义
+- atomic capability decomposition
+- checklist-style judger
+
+### 4.6 公开数据与代码资产如何兼容借鉴
+
+| 资产 | 原文要解决的问题 | 原文采用的方案 | 我们具体借什么 | 企业场景的兼容改造 |
+|---|---|---|---|---|
+| `Search-R1` 代码骨架 | 把推理模型稳定地训练成会搜索、会交替推理的 agent | action interleaving + RL + retrieved token masking | rollout/policy/reward 的最小闭环骨架 | 把单一网页搜索接口换成企业 4 类只读工具，删除 open-web 特有 prompt 与网页噪声假设 |
+| `ZeroSearch` 模拟搜索框架 | 在线搜索训练昂贵且不稳定 | simulated search + curriculum rollout | simulator API、cache 组织方式、离线训练范式 | 返回值从网页结果页改成文档块、实体字段、报表片段；cache truth 由企业快照维护 |
+| `SearchGym` 环境与评测设计 | 训练环境与评测环境不分离会导致 sim-to-real 失真 | synthetic/local/live 三层环境与可验证 ground truth | 环境分层与 evaluator 设计 | 改成 `synthetic-env / snapshot-env / shadow-live-env`，其中 live 只做上线前灰度验证，不进 RL |
+| `SimpleDeepSearcher` 数据配方 | 高质量 agent trajectory 太少 | teacher synthesis + quality curation | Gold/Silver 轨迹生成和样本筛选规则 | teacher 从 open-web 搜索改成企业 oracle/snapshot 检索，过滤条件增加证据回链与字段级校验 |
+| `syn-plan-research-data-sft/rl/eval` | 冷启动时浅搜、偏工具、早停 | synthetic plan 纠正探索行为 | plan schema、exploration label、plan-to-trajectory 流程 | 新增企业专属标签：并行可拆分、必须换工具、应拒答、应早停、应继续搜 |
+| `MedResearcher-R1` 图谱流水线 | 垂域多跳题与专用工具数据稀缺 | KG construction + trajectory generation pipeline | 图谱构建、多跳题生成、专用工具轨迹骨架 | KG 从医疗图谱改成企业实体图/制度依赖图/报表字段图/流程状态图 |
+| `DeepDive` 数据与标签设计 | 难题不足、冗余搜索无人惩罚 | KG 难题生成 + redundancy penalty | hard-case 模板与冗余标签定义 | 把重复网页 query 扩展成重复实体查找、重复过滤条件、重复报表读取 |
+| `OpenSeeker` 数据配方 | frontier search agent 缺少透明训练数据，teacher 轨迹又容易脏 | controllable QA synthesis + retrospective denoising | 企业 hard synthetic 构题模板与 Silver 轨迹去噪器 | 把 web graph topological expansion 改成企业依赖图扩展，把 denoising 改成结构化 `plan/evidence/answer` 压缩与过滤 |
+| `OpenResearcher` 离线环境与轨迹 | 长轨迹合成依赖外部 Search API，成本高且难复现 | 先 bootstrap 离线 corpus，再在 `search/open/find` 原语上合成长轨迹 | 本地 search service、离线 corpus bootstrap、轨迹合成流程 | 每次企业知识快照刷新时做一次 bootstrap，此后所有合成、评测、shadow 回放都用同一套本地索引 |
+| `Step-DeepResearch` 技术报告与框架 | 训练目标未按 planning/search/reflection/report 等能力拆开，judge 也不够稳 | atomic capability decomposition + checklist-style judger | 训练 curriculum 拆分方法与 checklist evaluator 结构 | 只吸收能力拆分和 evaluator 设计，不引入其 `file/todo/shell` 工具空间和开放式报告生成范式 |
+| `CaRR` rubric reward 资源 | 答对但证据链不完整 | citation-aware rubric reward server | rubric taxonomy 与 evidence scoring 结构 | citation 不向最终用户暴露，但训练/评测层强制保留 `answer -> evidence ids` 对齐 |
+| `HotpotQA / 2Wiki / MuSiQue` | 多跳分解能力不足 | 多跳问答监督数据 | 通用多跳分解先验 | 统一改写成企业工具协议格式，只保留 5%-10% 混合作为泛化补充，不能盖过企业主分布 |
+| `Bamboogle / PopQA` | 模型分不清“该搜”还是“直接靠参数知识答” | 构造 search-needed 与 parametric-memory 压力测试 | `should_search` / `should_answer_directly` 样本设计 | 不直接拿答案训练企业问答，而是转成路由分类和评测切片 |
+| `NQ / TriviaQA` | 检索表达多样、长尾 query 多 | 开放域检索问答监督 | query 构造与召回鲁棒性补充 | 仅用于 query rewrite 和 retriever 预热，不进入最终企业 answer-style 主训练集 |
+
+## 5. 工具协议与轨迹格式
+
+### 5.1 统一协议
+
+```json
+<plan>
+{"sub_questions":["..."],"parallelizable":true,"budget":{"max_turns":2,"max_calls":4}}
+</plan>
+<tool_call>
+{
+  "calls": [
+    {"id":"c1","name":"search_docs","arguments":{"query":"...","top_k":5,"filters":{"space":"kb"}}},
+    {"id":"c2","name":"lookup_entity","arguments":{"entity_type":"policy","keys":["..."]}}
+  ]
+}
+</tool_call>
+```
+
+```json
+<tool_response>
+{
+  "results": [
+    {"call_id":"c1","tool":"search_docs","items":[{"doc_id":"...","snippet":"...","score":0.91}]},
+    {"call_id":"c2","tool":"lookup_entity","items":[{"entity_id":"...","fields":{...}}]}
+  ],
+  "env_flags":{"empty":false,"tool_error":false,"timeout":false}
+}
+</tool_response>
+```
+
+### 5.2 为什么不用超长自由 CoT 做主格式
+- 难做稳定奖励
+- 不利于工具路由和轮次预算控制
+- 不利于后期接入 process reward
+- 对本地推理成本不友好
+
+结论：主训练目标是 `结构化 plan + tool_call + evidence + answer`，不是无限长 think 文本。
+
+### 5.3 这种协议借鉴了什么，为什么要这样改
+
+- 借鉴 `Search-R1`
+  - 原文问题：模型不会稳定地产生可执行 search action
+  - 原文方案：把 search action 嵌进推理轨迹
+  - 我们的改造：保留“推理中嵌工具”的核心，但把单一 search 改成统一的 `calls[]`
+
+- 借鉴 `ParallelSearch`
+  - 原文问题：可并行的问题被顺序执行，拖慢总时延
+  - 原文方案：让模型识别可并行子查询
+  - 我们的改造：在 `plan.parallelizable` 和 `tool_call.calls[]` 中显式编码并行可能性，方便奖励和评测
+
+- 借鉴 `OpenResearcher`
+  - 原文问题：长轨迹 search/browse loop 如果没有小而显式的动作原语，就难以稳定合成和评测
+  - 原文方案：使用 `search/open/find` 三个显式 browser primitive，并在离线语料上全链路可观测
+  - 我们的改造：继续坚持“小工具集 + 显式原语”；当前 v1 先保留 `search/open/lookup/report`，若长文档定位成为瓶颈，再加 `find_in_doc` 作为 v1.1 第五个只读工具
+
+- 借鉴 `Evaluate-as-Action` 与 `CaRR`
+  - 原文问题：中间证据质量无法被清晰监督
+  - 原文方案：把检索后评估和证据链监督显式化
+  - 我们的改造：输出里保留结构化 `evidence` 节点，而不是训练长篇自由 CoT，便于检查 `used_result_ids / confidence / conflict`
+
+## 6. 检索与环境层
+
+### 6.1 检索层
+企业检索采用三段式：
+
+- Sparse：BM25 / OpenSearch
+- Dense：企业语料 dense retriever
+- Rerank：cross-encoder reranker
+
+### 6.2 Retriever 单独训练
+必须单列工作流，参考 `Agentic-R`：
+
+- 用 agent 轨迹反标 passage utility
+- 按 query-passage relevance + final answer utility 训练企业 retriever
+- 不再沿用通用 RAG 检索器作为固定黑盒
+
+兼容改造：
+
+- 原文要解决的问题：RAG retriever 只按相似度训练，未必对 agent 最终答题有用
+- 原文方案：把 local relevance 和 global correctness 一起纳入 retriever 训练
+- 我们的改造：
+  - relevance 从公开 wiki passage 改成企业文档块、实体记录、报表片段
+  - utility 不只看最终 answer 是否正确，还要看是否减少工具轮次、是否帮助 early-stop、是否减少冲突证据
+  - retriever 训练要兼容三类目标：
+    - doc-level 召回
+    - entity-level 查准
+    - mixed evidence 重排
+
+### 6.3 训练环境
+首版训练环境采用 `离线快照 + 模拟器`：
+
+- `oracle cache`
+- `hard negative cache`
+- `empty cache`
+- `tool failure cache`
+- `conflict cache`
+
+训练阶段不允许直接访问真实企业系统。
+
+兼容改造：
+
+- 借鉴 `ZeroSearch`
+  - 原文问题：真实搜索太贵、噪声太大
+  - 原文方案：用模拟搜索和课程式 rollout
+  - 我们的改造：企业版模拟器不生成“网页”，而是返回快照化的文档片段、实体字段、报表片段
+
+- 借鉴 `SearchGym`
+  - 原文问题：静态快照和真实环境错位会污染奖励
+  - 原文方案：做可验证、严格可解的 synthetic environment，并和 eval/live 分层
+  - 我们的改造：训练集、评测集、灰度 live 环境三层隔离，所有奖励只依赖 snapshot truth，不依赖实时系统返回
+
+- 借鉴 `OpenResearcher`
+  - 原文问题：真实 Search API 太贵，长轨迹合成不可复现
+  - 原文方案：将一次性 corpus bootstrapping 与多轮 trajectory synthesis 解耦，并提供本地 search service
+  - 我们的改造：企业内网按“知识快照刷新周期”做 bootstrap；之后 teacher 回放、Silver 生成、RL 评测都统一调用同一套本地 snapshot search service
+
+### 6.4 企业版 SearchGym
+需要实现 3 套环境：
+
+- `synthetic-env`: 用于 RL 训练
+- `snapshot-env`: 用于离线评测
+- `shadow-live-env`: 仅用于上线前灰度验证
+
+## 7. 训练阶段
+
+### Phase A: 基础对齐
+目标：让 candidate student 稳定遵守工具协议。
+
+数据：
+- 企业简单问答
+- 工具参数对齐样本
+- 少量通用 tool-use 数据
+
+产出：
+- JSON/tool call 结构稳定
+- 明白什么问题应搜、什么问题应直接答、什么问题应拒答
+
+借鉴与改造：
+
+- `Search-R1`
+  - 解决的问题：先把“会不会调用工具”训出来
+  - 采用方案：用格式化搜索轨迹做 SFT/RL warm start
+  - 我们的调整：只保留协议学习，不在这一阶段追求深度多轮 reasoning
+
+- `R1-Searcher`
+  - 解决的问题：冷启动不必一开始就做复杂 PRM
+  - 采用方案：两阶段 outcome-based 起步
+  - 我们的调整：Phase A 只做协议和路由冷启动，降低工程复杂度
+
+### Phase B: 企业 Agent SFT
+目标：把企业内网问题分布、文档风格、工具路由装进模型。
+
+数据配比建议：
+- `50%` Gold 企业轨迹
+- `20%` Silver 轨迹
+- `15%` Hard synthetic 多跳样本
+- `10%` Boundary/negative 样本
+- `5%` 无搜索直接回答样本
+
+借鉴与改造：
+
+- `SimpleDeepSearcher`
+  - 解决的问题：高质量 agent 轨迹少
+  - 采用方案：重点做 trajectory synthesis 和 quality curation
+  - 我们的调整：企业 SFT 主战场就是数据质量，不在这一阶段追求最大规模
+
+- `MedResearcher-R1`
+  - 解决的问题：垂域知识和专用工具不适合直接用通用 agent 数据
+  - 采用方案：KG 构题 + 工具化轨迹流水线
+  - 我们的调整：把“医疗知识图谱”替换成企业实体/流程/制度关系图
+
+- `SynPlanResearch-R1`
+  - 解决的问题：模型浅搜、偏用某个工具
+  - 采用方案：synthetic plans 先纠正探索，再做 RL
+  - 我们的调整：专门合成“该并行时并行、该停时停、该切工具时切工具”的企业 plan 数据
+
+### Phase C: Retriever warmup
+目标：先把 dense retriever 拉到企业内网可用水平。
+
+借鉴与改造：
+
+- `Agentic-R`
+  - 解决的问题：通用 retriever 和 agentic-search 目标不一致
+  - 采用方案：agent 与 retriever 双向迭代
+  - 我们的调整：先单独训企业 retriever，再决定是否进入双向迭代；避免一开始把系统耦合过深
+
+- `SmartSearch`
+  - 解决的问题：query 不准会直接拖垮检索
+  - 采用方案：中间 query refinement
+  - 我们的调整：在 retriever warmup 阶段同步构造 query rewrite 数据和 alias normalization 规则
+
+### Phase D: Offline Agent RL
+目标：优化推理质量、工具路由、证据一致性、拒答与效率。
+
+先只训练：
+- `search_docs`
+- `lookup_entity`
+
+第二轮再纳入：
+- `open_doc`
+- `run_report_readonly`
+
+借鉴与改造：
+
+- `ZeroSearch`
+  - 解决的问题：在线 RL 成本过高
+  - 采用方案：模拟搜索训练
+  - 我们的调整：所有工具都先 snapshot 化，不允许真实系统进入 RL loop
+
+- `Search-P1`
+  - 解决的问题：失败路径完全浪费
+  - 采用方案：path-centric reward
+  - 我们的调整：路径评分中加入工具顺序、证据覆盖、预算控制三类企业指标
+
+- `Evaluate-as-Action`
+  - 解决的问题：检索后质量判断隐式、难 credit assignment
+  - 采用方案：把 evaluation 变成 action
+  - 我们的调整：把 evaluation 节点变成可解析结构，直接检查“这轮工具返回是否真的推进了问题求解”
+
+- `CaRR`
+  - 解决的问题：答对但证据链错
+  - 采用方案：citation-aware rubric reward
+  - 我们的调整：用户侧不暴露 citation，但训练侧强制 `answer -> evidence ids` 映射
+
+- `BAPO`
+  - 解决的问题：不愿承认不知道
+  - 采用方案：boundary-aware reward
+  - 我们的调整：把 IDK 细分成多种拒答原因，避免所有异常情况混为一种输出
+
+### Phase E: Efficiency tuning
+目标：压缩轮次和冗余调用。
+
+吸收论文：
+- `Search More, Think Less`
+- `ParallelSearch`
+- `Search Wisely`
+- `DeepDive`
+
+策略：
+- 并行子查询奖励
+- 冗余 query 惩罚
+- over-search 惩罚
+- under-search 惩罚
+- 成功早停奖励
+
+借鉴与改造：
+
+- `Search More, Think Less`
+  - 解决的问题：长 reasoning 带来高时延
+  - 采用方案：并行证据获取，少想多搜
+  - 我们的调整：不是盲目“少想”，而是在企业问题中把明显可拆分的子问题并行化
+
+- `ParallelSearch`
+  - 解决的问题：顺序搜索浪费时间
+  - 采用方案：识别独立 query 并行发出
+  - 我们的调整：只有在子问题互不依赖时才允许并行，避免企业工具并发带来资源浪费和逻辑错误
+
+- `Search Wisely`
+  - 解决的问题：over-search / under-search
+  - 采用方案：引入 uncertainty-aware reward
+  - 我们的调整：把 uncertainty 绑定到企业证据闭环，而不是开放领域主观不确定性
+
+- `DeepDive`
+  - 解决的问题：重复 query 和冗余探索
+  - 采用方案：redundancy penalty
+  - 我们的调整：重复实体、重复过滤条件、重复报表查询都记入冗余惩罚
+
+### Phase F: Memory augmentation
+目标：解决长流程问题的上下文膨胀。
+
+方法：
+- training-free summary memory baseline
+- 再用 `ReSum/MemSearcher` 风格做 memory-aware RL
+
+借鉴与改造：
+
+- `ReSum`
+  - 解决的问题：长历史塞不进上下文
+  - 采用方案：定期摘要历史，继续探索
+  - 我们的调整：摘要内容只保留已验证事实、已失败尝试、未解决子问题，不保留全文复述
+
+- `MemSearcher`
+  - 解决的问题：全历史太贵，只看当前轮信息又不足
+  - 采用方案：compact memory + memory-aware RL
+  - 我们的调整：memory 状态机做成结构化对象，后续既可给模型看，也可被评测脚本检查
+
+## 8. 奖励设计
+
+### 8.1 必须上线的奖励
+- `reward_format`
+- `reward_tool_schema`
+- `reward_tool_routing`
+- `reward_search_decision`
+- `reward_answer_correctness`
+- `reward_evidence_grounding`
+- `reward_abstain_boundary`
+- `reward_turn_budget`
+- `reward_tool_budget`
+- `reward_redundant_search_penalty`
+
+### 8.2 v2 可加的奖励
+- `reward_query_refinement`
+- `reward_parallel_decomposition`
+- `reward_memory_quality`
+- `reward_learned_prm`
+- `reward_checklist_judge`
+
+### 8.3 论文映射
+- Search-R1 / R1-Searcher：基线骨架
+- R1-Searcher++：internal vs external routing
+- SmartSearch：query reward
+- Search-P1：path reward
+- Evaluate-as-Action：检索后显式自评
+- CaRR：citation / rubric reward
+- BAPO：IDK boundary
+- Search Wisely：uncertainty-aware search decision
+- DeepDive：redundancy penalty
+- Step-DeepResearch：checklist judge
+
+### 8.4 奖励项与论文借鉴细化
+
+| 奖励项 | 要解决的问题 | 借鉴论文 | 原文方案 | 企业兼容改造 |
+|---|---|---|---|---|
+| `reward_tool_routing` | 工具选错或顺序错 | `Search-R1`, `SynPlanResearch-R1` | 学习工具调用与探索顺序 | 按企业 `oracle_tools` 和顺序容忍度打分，不要求唯一固定路径 |
+| `reward_search_decision` | 能直接答的问题仍然搜索，或该搜索时硬答 | `R1-Searcher++`, `Search Wisely` | internal knowledge utilization reward + uncertainty-aware search decision | 把“internal knowledge”解释成“当前已有证据与 compact memory 足够支撑回答”，否则必须继续搜或拒答 |
+| `reward_query_refinement` | query 粗糙、实体名不准 | `SmartSearch` | query-level process reward | 加企业别名表、字段映射、制度关键词扩展 |
+| `reward_answer_correctness` | 最终答案错 | `Search-R1`, `R1-Searcher` | outcome reward | 只作为必要项，不允许单独主导训练 |
+| `reward_evidence_grounding` | 答对但证据错 | `CaRR` | rubric + citation reward | 奖励以 `doc_id/section_id/entity_id` 命中为准，不要求用户侧输出引用 |
+| `reward_path_quality` | 失败路径无学习价值 | `Search-P1` | path-centric reward | 加入预算、工具顺序、证据覆盖等企业信号 |
+| `reward_evidence_check` | 检索质量无法即时反馈 | `Evaluate-as-Action` | 检索后立即自评 | 改成结构化 `evidence_check` 或环境侧评分 |
+| `reward_abstain_boundary` | 不会承认不知道 | `BAPO` | IDK boundary-aware reward | 区分证据不足、权限不足、工具异常、结果冲突 |
+| `reward_turn_budget` | 轮次过长 | `Search More, Think Less`, `Search Wisely` | 减少 reasoning steps / 过搜 | 只在保持准确率不下降时才给高奖励 |
+| `reward_tool_budget` | 调用太多、太贵 | `Search Wisely`, `ParallelSearch` | 控制 search 行为 | 区分必要调用与冗余调用，避免为了省调用漏掉关键信息 |
+| `reward_redundant_search_penalty` | 重复 query | `DeepDive` | redundancy penalty | 扩展到重复实体查找、重复报表、重复 filter |
+| `reward_memory_quality` | 摘要后丢关键信息 | `ReSum`, `MemSearcher` | memory-aware RL | v1 暂不强上 RL，先作为评测和 v2 目标 |
+| `reward_checklist_judge` | 单一 scalar reward 很难覆盖复杂企业回答质量 | `Step-DeepResearch` | checklist-style judger | v1 先作为离线 evaluator / reranker，检查证据覆盖、冲突处理、边界说明、预算纪律；不直接阻塞主 reward loop |
+
+## 9. 评测体系
+
+### 9.1 核心切片
+- 单文档问答
+- 多文档交叉验证
+- 文档 + 实体
+- 文档 + 报表
+- 冲突证据
+- 应拒答
+
+### 9.2 必须追踪的效率指标
+- `Avg Turns per Query`
+- `Avg Tool Calls per Query`
+- `Search Decision F1`
+- `Success@Turn<=1`
+- `Success@Turn<=2`
+- `Accuracy under tool_budget=2/4/6`
+- `Accuracy under max_turn=1/2/3`
+- `P50/P95 latency`
+- `Avg prompt tokens`
+- `Avg completion tokens`
+
+### 9.3 质量指标
+- `Answer Accuracy`
+- `Oracle Tool Hit Rate`
+- `Evidence Recall@k`
+- `Grounded Citation Precision`
+- `Invalid Tool JSON Rate`
+- `Abstain Precision / Recall`
+
+### 9.4 通过线
+- `Invalid Tool JSON Rate < 1%`
+- `Grounded Citation Precision > 90%`
+- `Abstain Precision > 90%`
+- `多工具问题准确率 > 75%`
+- `Avg Turns <= 2.2`
+- `Avg Tool Calls <= 3.5`
+
+### 9.5 论文借鉴对应的专项评测
+
+- 借鉴 `Search Wisely`
+  - 新增 `Over-search Rate` 与 `Under-search Rate`
+  - 判断模型是否在本可直接回答时仍然搜索，或该继续搜索时过早停止
+
+- 借鉴 `ParallelSearch`
+  - 新增 `Parallelizable Question Utilization`
+  - 对可并行题型，检查模型是否真的并发调用而不是顺序串行
+
+- 借鉴 `BAPO`
+  - 新增 `Boundary Error Breakdown`
+  - 细分统计“该拒答未拒答”“该澄清未澄清”“该报错未报错”
+
+- 借鉴 `CaRR`
+  - 新增 `Evidence Chain Completeness`
+  - 检查回答中每个关键结论是否都能回链到 snapshot 证据
+
+- 借鉴 `Step-DeepResearch`
+  - 新增 `Checklist Pass Rate`
+  - 统一检查是否覆盖关键子问题、是否声明冲突/不确定性、是否遵守轮次和调用预算
+
+## 10. 实施节奏
+
+### Week 1
+- 建立统一 schema
+- 接 4 类只读工具
+- 构建 snapshot cache
+- 完成 model bakeoff 小样本实验
+
+### Week 2
+- Gold/Silver/Boundary 数据引擎跑通
+- 完成第一批 10k-30k agent 轨迹
+- 完成基础对齐 SFT
+
+### Week 3
+- 完成企业 retriever warmup
+- 完成企业 Agent SFT
+- 接入基础评测与效率预算评测
+
+### Week 4
+- 上线 Offline RL v1
+- 先加 routing / grounding / abstain / turn_budget 奖励
+- 跑 shadow evaluation
+
+### Week 5
+- 加入 parallel decomposition 与 redundancy penalty
+- 比较是否明显降低轮次与调用数
+
+### Week 6
+- 引入 summary memory
+- 进入 shadow-live-env
+- 准备 analyst-assist 灰度
+
+## 11. 论文借鉴到实现模块的详细映射
+
+### 11.1 数据与轨迹模块
+
+| 模块 | 借鉴论文 | 原文要解决的问题 | 原文采用的方案 | 我们的兼容调整 | 直接落地动作 |
+|---|---|---|---|---|---|
+| `gold_builder` | `SimpleDeepSearcher`, `Search-R1` | 有答案但没有高质量 agent trajectory | 用高质量合成轨迹做冷启动，并把工具动作嵌入推理过程 | 不从真实搜索回放，而是从 `support_docs/support_entities` 反演最短可行路径 | 生成 `plan -> tool_call -> evidence -> answer` 的可验证 Gold 样本 |
+| `silver_replay` | `SynPlanResearch-R1`, `DeepResearcher` | 只有问题和答案时，模型容易乱搜或浅尝辄止 | 用 synthetic plan 或真实环境 teacher 轨迹补全过程 | v1 不跑真实系统 RL，只借 teacher 的 cross-check/反思式轨迹，用 snapshot 检索回放校验 | 保留“答对且证据可回链”的 Silver 轨迹，其余丢弃或回炉 |
+| `trajectory_denoiser` | `OpenSeeker` | teacher 轨迹噪声大、冗余动作多会污染 SFT | retrospective summarization 做轨迹去噪 | 把自由文本 retrospection 改成结构化 `plan/evidence/loops/answer` 压缩器 | 过滤冗余轮次、无贡献调用和只会“搜到死”的 teacher trace |
+| `graph_constructor` | `MedResearcher-R1`, `DeepDive` | 垂域 hard multi-hop 数据缺乏 | 用 KG 构图、构题、生成多跳轨迹，并制造难题 | 图谱节点改成企业实体、文档段落、制度依赖、报表字段、流程状态 | 产出 `2-3 工具 / 2-4 文档` 才能解的问题，以及长链依赖 hard case |
+| `capability_curriculum` | `Step-DeepResearch` | 训练目标混成一团，模型不容易稳态学会规划、查证、回答 | 按 atomic capabilities 组织 progressive training | 改成企业版四层 curriculum：路由、证据获取、交叉验证、答案/拒答 | 用于组织 Phase A/B 的样本配比和课程顺序 |
+| `boundary_builder` | `BAPO`, `CaRR` | 只会做正样本会导致上线后错答风险高 | 训练 IDK 边界，并用证据链约束模型不要乱答 | Boundary 从单一 IDK 扩成证据不足、权限不足、工具失败、结果冲突四大类 | 生成 boundary 标签、拒答模板与 evidence-missing 负样本 |
+| `efficiency_pair_builder` | `Search Wisely`, `Search More, Think Less`, `ParallelSearch` | 模型学会能答对但很慢的路径 | 比较不同搜索策略，鼓励更高效路径 | 企业题中同时保留最短路径、冗余路径、并行可拆分路径 | 为后续 RL 提供 pairwise 路径偏好与预算标签 |
+
+### 11.2 环境、检索与策略模块
+
+| 模块 | 借鉴论文 | 原文要解决的问题 | 原文采用的方案 | 我们的兼容调整 | 直接落地动作 |
+|---|---|---|---|---|---|
+| `snapshot_simulator` | `ZeroSearch` | 在线搜索 RL 太贵、噪声太大 | simulated search + curriculum | 模拟器不返回 SERP，而返回企业文档块、实体字段、报表片段与错误码 | 建立 `oracle/negative/empty/failure/conflict` 五类 cache |
+| `offline_corpus_bootstrap` | `OpenResearcher` | 长轨迹 search/browse 合成依赖外部 Search API，成本高且不可复现 | 一次性 bootstrap 本地 corpus，再在离线 search service 上做 trajectory synthesis | bootstrap 目标改成企业 wiki、制度库、FAQ、实体目录、报表说明的快照索引 | 每次知识更新先 rebuild 索引，再统一供数据合成、评测与 shadow 使用 |
+| `env_split` | `SearchGym` | 训练环境和真实环境错位会污染奖励 | synthetic/local/live 分层环境与可验证真值 | 改成 `synthetic-env / snapshot-env / shadow-live-env` 三层；live 只验证不训练 | 奖励只读取 snapshot truth，避免把线上波动写进 RL |
+| `retriever_trainer` | `Agentic-R` | 通用 RAG retriever 与 agent 目标不一致 | 用 query relevance + final utility 共同训练 retriever | utility 里加入轮次减少、冲突减少、early-stop 贡献，而不只看答对率 | 单独训练企业 dense retriever 与 reranker，不把检索层当黑盒 |
+| `query_rewriter` | `SmartSearch` | 中间 query 质量差会拖垮整条路径 | query-level reward + refinement | 引入别名展开、字段映射、制度关键词补全、实体标准化 | 训练 query rewrite、alias normalize、filter completion 三类子任务 |
+| `policy_baseline` | `Search-R1`, `R1-Searcher` | 冷启动时模型既不会调工具，也没有稳定 RL 骨架 | outcome-driven search RL 与格式化冷启动 | v1 先借骨架，不直接照抄 open-web prompt 与 reward | 形成最小可跑 policy：会搜、会停、会拒答、会给 evidence |
+| `route_controller` | `R1-Searcher++` | 模型对“该直接答还是继续搜”没有稳定决策 | internal knowledge reward + external search reward + memorization | internal knowledge 改成“参数能力 + 当前 compact memory + 已验证证据”，而非模型幻觉自信 | 训练 `should_search / should_answer / should_stop` 路由，并接入 memory |
+| `shadow_eval_driver` | `DeepResearcher` | 静态环境学不到真实交互中的交叉验证与诚实失败 | 在真实环境 end-to-end RL 中涌现计划、交叉验证、自反思 | 不做真实环境 RL，但把这些行为拿来做 shadow-live 评测目标和 teacher 轨迹模板 | 检查 cross-check、conflict resolution、honest failure 三类行为是否出现 |
+
+### 11.3 奖励、效率与记忆模块
+
+| 模块 | 借鉴论文 | 原文要解决的问题 | 原文采用的方案 | 我们的兼容调整 | 直接落地动作 |
+|---|---|---|---|---|---|
+| `path_reward` | `Search-P1` | 失败轨迹完全没有学习价值 | path-centric reward，从中间路径提取信用 | 路径分不只看答案，还看工具顺序、证据覆盖、预算使用、是否早停 | rollout 后对每条路径打局部分，失败路径也可进入更新 |
+| `evidence_check_node` | `Evaluate-as-Action` | 检索质量判断隐式存在，credit assignment 太粗 | 把检索后自评变成显式动作 | 自评不写成长 CoT，而写成结构化 `evidence_check` 或环境评分 | 每轮检索后强制判断“是否推进了求解” |
+| `grounding_reward` | `CaRR` | 答对但证据链不对 | citation-aware rubric reward | 训练时保留 `doc_id/section_id/entity_id`，用户侧答案不暴露 citation 文本 | 以 evidence completeness / precision / conflict 组成 rubric 分 |
+| `boundary_reward` | `BAPO` | 不愿承认不知道，或把 IDK 当捷径 | boundary-aware reward，平衡可靠性与回答率 | 将 IDK 细分成证据不足、权限不足、工具异常、结果冲突 | 建立四类拒答 precision/recall 与错误细分 |
+| `learned_prm_v2` | `ProRAG` | 规则奖励不足以处理长链复杂 credit assignment | learned process reward model | v1 不上 learned PRM，先把规则边界跑清楚；v2 再蒸馏规则与人工偏好 | 预留 reward server 接口，不在首版阻塞主线 |
+| `parallel_planner` | `Search More, Think Less`, `ParallelSearch` | 可并行的问题被顺序执行，导致轮次和时延过高 | parallel evidence acquisition + 并行子查询识别 | 只有互不依赖的子问题才允许并行，避免企业系统资源浪费 | 在 `plan.parallelizable` 和 `tool_call.calls[]` 上做监督与奖励 |
+| `search_budget_controller` | `Search Wisely`, `R1-Searcher++` | over-search / under-search 共存 | uncertainty-aware search decision + internal/external routing | uncertainty 绑定到证据闭环、memory 覆盖率和冲突状态，而不是自由主观信心 | 输出 `should_search / should_stop / need_more_evidence` 并纳入 reward |
+| `checklist_evaluator` | `Step-DeepResearch` | 单一 reward 难覆盖复杂回答质量与稳健性 | checklist-style judger | 改成企业 QA checklist：关键槽位覆盖、证据闭环、冲突说明、拒答原因、预算纪律 | 先做离线 evaluator 和 error taxonomy，不直接替代主奖励 |
+| `summary_memory` | `ReSum` | 长历史持续膨胀，导致后续探索越来越贵 | 周期性摘要历史，并做 segmented RL | 首先做 training-free summary，再判断是否要上 ReSum-GRPO | 只保留已验证事实、未解决子问题、失败尝试、冲突点 |
+| `compact_memory_rl` | `MemSearcher` | 全历史太贵，只看当前轮又丢信息 | compact memory + multi-context GRPO | memory 做成结构化状态对象，而不是自由文本长摘要 | 保留 `verified_facts / tried_queries / unresolved_slots / conflict_flags` 四类槽位 |
+
+## 12. 最终决策
+
+完整看完这批论文后，推荐的首版路线是：
+
+- `数据引擎优先`，不是 `在线 RL 优先`
+- `离线环境优先`，不是 `真实系统 rollout 优先`
+- `少量只读工具优先`，不是 `全量工具优先`
+- `结构化中间状态优先`，不是 `长 CoT 优先`
+- `路径与证据奖励优先`，不是 `只看最终答案`
+- `预算内最优`，不是 `无上限 deep research`
+
+最应该落地的论文组合：
+
+- 冷启动：`SimpleDeepSearcher + MedResearcher-R1 + SynPlanResearch-R1 + DeepDive`
+- 环境：`ZeroSearch + SearchGym`
+- 基线：`Search-R1 + R1-Searcher`
+- 路由与搜停决策：`R1-Searcher++ + Search Wisely`
+- 检索器：`Agentic-R + SmartSearch`
+- 可靠性：`CaRR + BAPO + Evaluate-as-Action + Search-P1`
+- 效率：`Search More, Think Less + ParallelSearch + Search Wisely + DeepDive`
+- 长链路：`ReSum + MemSearcher`
+- 离线长轨迹与本地检索补充：`OpenResearcher + OpenSeeker`
+- 能力拆分与 evaluator 补充：`Step-DeepResearch`
+- 真实交互上限参考：`DeepResearcher`
